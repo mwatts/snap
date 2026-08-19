@@ -1,16 +1,5 @@
 # Rust
-app/src-tauri/target/
-
-# Node
-app/node_modules/
-
-# Python
-mcp-server/__pycache__/
-mcp-server/*.egg-info/
-mcp-server/.venv/
-
-# Tauri build artifacts
-app/src-tauri/gen/
+/target/
 
 # OS
 .DS_Store
@@ -24,10 +13,6 @@ Thumbs.db
 # Temp files
 /tmp/snap-*
 
-# Lock files from overlay
-*.lock
-
 # Editor
 .vscode/
 .idea/
-*.pyc

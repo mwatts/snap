@@ -1,6 +1,6 @@
 # Snap Setup Guide
 
-Step-by-step instructions to build, install, and configure Snap on Linux.
+Build, install, and configure the `snap` CLI and daemon.
 
 ---
 
@@ -10,322 +10,141 @@ Step-by-step instructions to build, install, and configure Snap on Linux.
 
 | Dependency | Purpose | Install |
 |-----------|---------|---------|
-| Rust toolchain | Builds the Tauri app | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| Node.js 18+ | Tauri CLI and frontend bundling | `nvm install 20` or [nodejs.org](https://nodejs.org) |
-| Python 3.11+ | MCP server runtime | Usually pre-installed on Ubuntu 22.04+ |
-| uv | Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| Rust toolchain | Builds `snap` | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 
-### System Libraries (Ubuntu/Debian)
+You do not need Node, Python, or a WebView.
+
+### macOS compile note
+
+A first compile of GPUI may need the Command Line Tools SDK. If Xcode 26 bindgen fails, point `SDKROOT` at `MacOSX15.4.sdk` or the newest 15.x SDK:
 
 ```bash
-sudo apt install -y \
-  pkg-config \
-  libwebkit2gtk-4.1-dev \
-  build-essential \
-  libxdo-dev \
-  libssl-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev
+export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk"
+export BINDGEN_EXTRA_CLANG_ARGS="--target=arm64-apple-darwin -isysroot ${SDKROOT}"
 ```
 
-### Screen Capture Tool
+### Linux capture tool
 
-You need **one** of these, depending on your display server:
+Install **one** of these tools:
 
 | Display Server | Tool | Install |
 |---------------|------|---------|
-| GNOME on Wayland (Ubuntu default) | `gnome-screenshot` | `sudo apt install gnome-screenshot` |
+| GNOME on Wayland | `gnome-screenshot` | `sudo apt install gnome-screenshot` |
 | wlroots Wayland (Sway, Hyprland) | `grim` | `sudo apt install grim` |
 | X11 | `scrot` | `sudo apt install scrot` |
 
-**How to check your display server:**
+Check your display server:
+
 ```bash
 echo $XDG_SESSION_TYPE
-# "wayland" or "x11"
 ```
 
-Snap tries capture tools in order of preference and uses the first one that works. Install multiple if you switch between display servers.
+Snap tries capture tools in order and uses the first one that works.
 
-### Window Context (Optional, X11 only)
+### Window context (optional, X11 only)
 
 ```bash
 sudo apt install xdotool
 ```
 
-This captures the active window title, class, and PID when you trigger Snap. On Wayland, window context is not available (GNOME doesn't expose it to external tools). The sidecar JSON will have `null` for these fields on Wayland — annotations still work fine, the agent just won't know which window you were looking at.
+This fills the sidecar `source` fields. On Wayland those fields stay empty. Annotations still save.
 
 ---
 
-## Build
-
-### 1. Build the Tauri App
+## Build and install
 
 ```bash
-cd app
-npm install
-npx tauri build
-```
-
-This produces a release binary at:
-```
-app/src-tauri/target/release/snap
-```
-
-Build takes ~60-90 seconds on first run (compiling ~500 Rust crates). Subsequent rebuilds are ~20 seconds.
-
-### 2. Install the MCP Server
-
-```bash
-cd mcp-server
-uv venv .venv
-uv pip install -e .
-```
-
-### 3. Verify Both Components
-
-```bash
-# Check the binary exists
-ls -lh app/src-tauri/target/release/snap
-
-# Check the MCP server loads
-mcp-server/.venv/bin/python -c "from server import mcp; print('MCP server OK')"
-```
-
-Or use the Makefile:
-```bash
-make build
-```
-
----
-
-## Configure the Global Hotkey
-
-### GNOME on Wayland (Ubuntu 22.04+, default)
-
-Tauri's global shortcut plugin doesn't work on Wayland. Instead, GNOME handles the hotkey and runs a trigger script.
-
-**1. Make the trigger script executable:**
-```bash
-chmod +x snap-trigger.sh
-```
-
-**2. Register the GNOME custom keybinding:**
-```bash
-gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings \
-  "['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/snap/']"
-
-gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/snap/ \
-  name "Snap Annotation"
-
-gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/snap/ \
-  command "$HOME/Desktop/snap/snap-trigger.sh"
-
-gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/snap/ \
-  binding "<Control><Shift>s"
-```
-
-**3. Test it:**
-
-Press `Ctrl+Shift+S`. The overlay should appear with a screenshot of your desktop.
-
-**To change the hotkey**, replace `<Control><Shift>s` with your preferred combo. Examples:
-- `<Super><Shift>s` — Windows key + Shift + S
-- `<Control><Shift>x` — Ctrl + Shift + X
-
-**To remove the keybinding:**
-```bash
-gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "[]"
-```
-
-### X11
-
-On X11, Snap runs as a background tray app with a built-in global hotkey. No GNOME keybinding needed.
-
-```bash
-# Install and enable the systemd service
 make install
 ```
 
-Or manually:
+`make install` runs `cargo build --release`, copies the binary to `~/.local/bin/snap`, and starts the daemon at login:
+
+- macOS: launchd loads `com.adjective.snap.plist` and runs `snap daemon`
+- Linux: systemd user service runs `snap daemon`
+
+Add `~/.local/bin` to your `PATH` if `snap` is not found.
+
+### Service commands
+
 ```bash
-mkdir -p ~/.config/systemd/user
-cp snap.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable snap.service
-systemctl --user start snap.service
+make start     # snap start
+make stop      # snap stop
+make status    # snap status
+make logs      # tail ~/.snap/snap.log
 ```
 
-The app starts silently in the system tray. Press `Ctrl+Shift+S` to trigger the overlay.
+You can also run the same commands on the binary:
 
-**Service management:**
 ```bash
-make start     # Start the service
-make stop      # Stop the service
-make restart   # Restart after rebuild
-make status    # Check if running
-make logs      # Tail the systemd journal
-```
-
-### Other Wayland Compositors (Sway, Hyprland, etc.)
-
-Bind `Ctrl+Shift+S` to the trigger script in your compositor config:
-
-**Sway** (`~/.config/sway/config`):
-```
-bindsym Ctrl+Shift+s exec ~/Desktop/snap/snap-trigger.sh
-```
-
-**Hyprland** (`~/.config/hypr/hyprland.conf`):
-```
-bind = CTRL SHIFT, S, exec, ~/Desktop/snap/snap-trigger.sh
+snap start
+snap stop
+snap status
+snap doctor
 ```
 
 ---
 
-## Register the MCP Server
+## Init a repo
 
-### Automatic Setup (Recommended)
-
-The setup script detects which AI tools you have installed and registers Snap with all of them:
+Run this once in each project that should receive snaps:
 
 ```bash
-./setup-mcp.sh
+cd /path/to/repo
+snap init
 ```
 
-Output looks like:
-```
-Snap MCP Setup
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✓ MCP server verified
+`snap init` creates `.snap/`, registers the repo, sets it as last-active, and patches agent markdown (`AGENTS.md` or `CLAUDE.md`).
 
-Detecting installed tools...
+A second run is safe. It does not duplicate the markdown block.
 
-✓ Claude Code — registered
-✓ Claude Desktop — configured at ~/.config/Claude/claude_desktop_config.json
-✓ Cursor — configured at ~/.cursor/mcp.json
-⊘ Windsurf — not installed, skipping
-```
-
-It auto-detects and configures: **Claude Code**, **Claude Desktop**, **Cursor**, and **Windsurf**. Tools that aren't installed are skipped.
-
-### Manual Setup
-
-If you prefer to register manually, or use a tool the script doesn't cover:
-
-**Claude Code:**
-```bash
-claude mcp add --transport stdio snap -- \
-  $HOME/Desktop/snap/mcp-server/.venv/bin/python \
-  $HOME/Desktop/snap/mcp-server/server.py
-```
-
-**Claude Desktop** — add to `~/.config/Claude/claude_desktop_config.json` (Linux) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
-```json
-{
-  "mcpServers": {
-    "snap": {
-      "command": "/home/YOU/Desktop/snap/mcp-server/.venv/bin/python",
-      "args": ["/home/YOU/Desktop/snap/mcp-server/server.py"]
-    }
-  }
-}
-```
-
-**Cursor** — add to `~/.cursor/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "snap": {
-      "command": "/home/YOU/Desktop/snap/mcp-server/.venv/bin/python",
-      "args": ["/home/YOU/Desktop/snap/mcp-server/server.py"]
-    }
-  }
-}
-```
-
-**Windsurf** — add to `~/.codeium/windsurf/mcp_config.json`:
-```json
-{
-  "mcpServers": {
-    "snap": {
-      "command": "/home/YOU/Desktop/snap/mcp-server/.venv/bin/python",
-      "args": ["/home/YOU/Desktop/snap/mcp-server/server.py"]
-    }
-  }
-}
-```
-
-**VS Code + Cline** — add to Cline's MCP settings in the extension config:
-```json
-{
-  "snap": {
-    "command": "/home/YOU/Desktop/snap/mcp-server/.venv/bin/python",
-    "args": ["/home/YOU/Desktop/snap/mcp-server/server.py"]
-  }
-}
-```
-
-**Any other MCP client** — the two values you need:
-```
-command: /home/YOU/Desktop/snap/mcp-server/.venv/bin/python
-args:    /home/YOU/Desktop/snap/mcp-server/server.py
-```
-
-Replace `/home/YOU/Desktop/snap` with wherever you cloned the repo.
-
-### Verify
+To point the hotkey at a different repo:
 
 ```bash
-# Claude Code
-claude mcp list
-# Should show: snap: ... - ✓ Connected
+snap use /path/to/other/repo
 ```
-
-### Test It
-
-1. Take a snap annotation (`Ctrl+Shift+S` → draw → Enter)
-2. Open any registered agent
-3. Say: "check my latest snap annotation"
-4. The agent calls `get_latest_annotation()`, reads the image, and sees what you marked
 
 ---
 
-## Add Snap Awareness to CLAUDE.md
+## macOS permissions
 
-Add this to your global `~/.claude/CLAUDE.md` so Claude Code automatically checks for annotations:
+The daemon needs Screen Recording and Accessibility.
 
-```markdown
-## Snap — Visual Annotations
+1. Start the daemon (`make install` or `snap start`).
+2. Press `Ctrl+Shift+S` once.
+3. Allow **Screen Recording** if macOS asks.
+4. Allow **Accessibility** if macOS asks.
 
-You have access to the `snap` MCP tools for reading annotated screenshots.
+If a prompt never appears, open System Settings > Privacy & Security and add `snap` by hand.
 
-### Tools:
-- `check_new_annotations()` — call at the start of every task to see if there's visual feedback
-- `get_latest_annotation()` — returns the most recent annotated screenshot path + metadata
-- `list_annotations(last_n)` — returns recent annotations
-- `get_annotation(filename)` — returns a specific annotation
-- `clear_inbox()` — deletes processed annotations
+If Screen Recording is missing, `snap doctor` prints:
 
-### When to use:
-- At the START of any UI/frontend task, call `check_new_annotations()` first
-- If the user says "look at my annotation" or "check my snap", call `get_latest_annotation()`
-- After getting metadata, READ THE IMAGE at `image_path` to see the annotated screenshot
-- Use `source.window_title` to infer which page/component the user was looking at
-
-### How to interpret:
-- Red circles/rectangles = "this area has a problem"
-- Arrows = "this should move/connect there"
-- Text labels = literal instructions ("fix this", "16px gap", "wrong color")
-- Numbered markers = ordered list of issues (fix #1 first, then #2, etc.)
-- Freehand marks = emphasis, "look at this general area"
+```
+Screen Recording permission is missing. Enable it in System Settings > Privacy & Security > Screen Recording.
 ```
 
-For project-specific CLAUDE.md files, add a shorter pointer:
+If permissions get stuck:
 
-```markdown
-## Visual Feedback
-This project uses Snap for visual annotations. Call `check_new_annotations()` at the start of UI tasks.
+```bash
+tccutil reset All com.adjective.snap
+snap start
 ```
+
+---
+
+## Verify
+
+```bash
+snap doctor
+snap status
+```
+
+Then:
+
+1. `cd` into an inited repo (or run `snap use` there).
+2. Press `Ctrl+Shift+S` (or run `snap capture`).
+3. Draw a circle. Press Enter.
+4. Run `snap latest`.
+5. Confirm `image_path` is under that repo's `.snap/inbox/`.
 
 ---
 
@@ -333,130 +152,87 @@ This project uses Snap for visual annotations. Call `check_new_annotations()` at
 
 | Path | Purpose |
 |------|---------|
-| `~/.snap/inbox/` | Annotated screenshots + sidecar JSON |
-| `~/.snap/snap.log` | Event log (auto-rotates at 1MB) |
-| `~/.snap/.last_read` | MCP server's read cursor (tracks which annotations are "new") |
-| `/tmp/snap-capture.png` | Temporary screen capture (overwritten each time) |
-| `/tmp/snap-overlay.lock` | Lock file preventing concurrent overlays |
+| `<repo>/.snap/inbox/` | Annotated screenshots + sidecar JSON |
+| `<repo>/.snap/config.toml` | Project name (committed) |
+| `<repo>/.snap/last_read` | Agent read cursor (local) |
+| `~/.snap/state.toml` | Last-active project |
+| `~/.snap/projects.toml` | Registry of inited repos |
+| `~/.snap/snap.sock` | Daemon Unix socket |
+| `~/.snap/snap.pid` | Daemon pid |
+| `~/.snap/snap.log` | Event log (auto-rotates at 1 MB) |
+
+On Linux, if `XDG_RUNTIME_DIR` is set, the socket is `$XDG_RUNTIME_DIR/snap.sock`.
 
 ---
 
 ## Troubleshooting
 
-### "Screen capture failed" error on overlay
+### `snap` is not found
 
-**Cause:** No screenshot tool installed, or the installed tool doesn't work with your display server.
+Add `~/.local/bin` to `PATH`, or run `~/.local/bin/snap`.
 
-**Fix:** Install the right tool for your display server (see Prerequisites above). Test it manually:
+### Daemon is not running
+
 ```bash
-# GNOME Wayland
-gnome-screenshot --file=/tmp/test.png && echo "OK"
-
-# wlroots Wayland
-grim /tmp/test.png && echo "OK"
-
-# X11
-scrot /tmp/test.png && echo "OK"
-```
-
-### Hotkey doesn't do anything (Wayland)
-
-**Cause:** GNOME custom keybinding not registered, or `snap-trigger.sh` isn't executable.
-
-**Fix:**
-```bash
-# Check the keybinding is registered
-gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings
-
-# Make sure the script is executable
-chmod +x snap-trigger.sh
-
-# Check the log for trigger events
+snap start
+snap status
+snap doctor
 tail ~/.snap/snap.log
 ```
 
-### Overlay appears but annotations don't save
+### Hotkey does nothing
 
-**Cause:** The `Enter` key or save button isn't connected, or the inbox directory isn't writable.
+The daemon must be up. A valid last-active project must exist.
 
-**Fix:**
 ```bash
-# Check the inbox directory exists and is writable
-ls -la ~/.snap/inbox/
-
-# Check the log for save events
-grep "Saved annotation" ~/.snap/snap.log
-
-# Try clicking the green checkmark button instead of pressing Enter
+snap start
+snap init          # or: snap use /path/to/repo
+snap doctor
 ```
 
-### Screenshot appears zoomed in or tiny in the corner
+### Screen capture failed
 
-**Cause:** HiDPI scaling mismatch. The app needs to know your display's pixel ratio.
+Install a capture tool for your display server (see Prerequisites). On macOS, grant Screen Recording.
 
-**Fix:** This is handled automatically in the latest version. If you still see issues:
-```bash
-# Check your display scale
-python3 -c "
-import gi; gi.require_version('Gdk', '3.0')
-from gi.repository import Gdk
-d = Gdk.Display.get_default()
-m = d.get_monitor(0)
-print(f'Resolution: {m.get_geometry().width}x{m.get_geometry().height}, Scale: {m.get_scale_factor()}')
-"
-```
+### Overlay does not save
 
-### MCP server not connected
+Confirm the last-active repo has `.snap/config.toml`. Check `~/.snap/snap.log` for save errors.
 
-**Fix:**
-```bash
-# Re-register
-claude mcp remove snap
-claude mcp add --transport stdio snap -- \
-  $HOME/Desktop/snap/mcp-server/.venv/bin/python \
-  $HOME/Desktop/snap/mcp-server/server.py
+### Old `~/.snap/inbox/` still has files
 
-# Verify
-claude mcp list
-```
-
-### Overlay window doesn't close after save
-
-**Cause:** The process might be stuck.
-
-**Fix:**
-```bash
-# Kill it
-kill $(pgrep -f "target/release/snap")
-rm -f /tmp/snap-overlay.lock
-```
+That global inbox is not used. Per-repo inbox is `<repo>/.snap/inbox/`. `snap doctor` prints a note if the old inbox has `snap-*.json` files. Snap does not migrate those files.
 
 ### Log file growing too large
 
-Won't happen — both the Rust app and MCP server auto-rotate `~/.snap/snap.log` at 1MB, keeping one backup at `snap.log.old`.
+The log auto-rotates at 1 MB and keeps one backup at `snap.log.old`.
 
 ---
 
 ## Uninstall
 
 ```bash
-# Remove GNOME keybinding (Wayland)
-gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "[]"
-
-# Remove systemd service (X11)
-systemctl --user stop snap.service
-systemctl --user disable snap.service
-rm ~/.config/systemd/user/snap.service
-
-# Remove MCP server from Claude Code
-claude mcp remove snap
-
-# Remove Snap data
-rm -rf ~/.snap
-
-# Remove Snap awareness from ~/.claude/CLAUDE.md
-# (edit manually — remove the "Snap — Visual Annotations" section)
-
-# Delete the repo
-rm -rf ~/Desktop/snap
+snap stop
+rm -f ~/.local/bin/snap
 ```
+
+macOS:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.adjective.snap.plist 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/com.adjective.snap.plist
+```
+
+Linux:
+
+```bash
+systemctl --user disable --now snap.service
+rm -f ~/.config/systemd/user/snap.service
+```
+
+Remove Snap data:
+
+```bash
+rm -rf ~/.snap
+```
+
+Each repo still has a local `.snap/` directory. Delete those by hand if you want them gone.

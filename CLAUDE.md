@@ -1,39 +1,56 @@
 # Snap -- Project Context for Claude Code
 
+Always load the rust skill at the start of each session when working in this project.
+
 ## What this is
 
-A two-component system: a Tauri 2.x desktop app (Rust + vanilla JS) for screen annotation, and a Python MCP server that exposes the annotation inbox to coding agents.
+Snap is one Rust binary. It captures the screen, lets a human annotate it, and writes a PNG + JSON pair for coding agents.
+
+There is no MCP server. There is no Tauri app. There is no Node. There is no Python.
+
+## Four roles
+
+The same `snap` binary is four roles. Role is a subcommand, not a second install.
+
+| Role | How it starts | Needs daemon? |
+|------|---------------|---------------|
+| Daemon | `snap daemon` (launchd/systemd) or `snap start` | it is the daemon |
+| Agent CLI | `snap check`, `latest`, `list`, `get`, `clear` | no |
+| Project init | `snap init`, `snap use`, `snap projects` | no |
+| Overlay | hotkey or `snap capture` | yes |
 
 ## Architecture
 
-- `app/` -- Tauri 2.x project. Vanilla HTML/CSS/JS frontend, no framework. Rust backend handles screen capture, window context, and file I/O.
-- `mcp-server/` -- Python package using `fastmcp`. Stdio transport. Reads from `~/.snap/inbox/`.
+- One crate at the repo root. Edition 2024. `rust-version = "1.85"`.
+- `src/main.rs` only parses CLI and calls `snap::cli::run()`.
+- Agent commands read `<repo>/.snap/inbox/` on disk.
+- The daemon is one process: a Unix socket thread plus a GPUI event loop.
+- Last-active project in `~/.snap/state.toml` selects the inbox for a hotkey save.
+- Overlay is GPUI. Composite uses `tiny-skia`.
 
 ## Key decisions
 
-- Vanilla JS for the overlay frontend. No React, no build tooling beyond what Tauri provides.
-- Screen capture uses `gnome-screenshot` (GNOME Wayland), `grim` (wlroots Wayland), or `scrot` (X11) via subprocess. Tries each in order, uses the first that works.
-- Window context uses `xdotool` on X11. Returns None on Wayland.
-- Annotations stored as PNG + sidecar JSON pairs in `~/.snap/inbox/`.
-- MCP server is read-only. It never writes annotations, only reads and deletes.
-- On Wayland: app runs in single-shot overlay mode, triggered by GNOME custom keybinding via `snap-trigger.sh`.
-- On X11: app runs as a persistent tray app with built-in global hotkey via Tauri's global-shortcut plugin.
+- Per-repo inbox at `<repo>/.snap/inbox/`. Never write `~/.snap/inbox/`.
+- Agent commands work when the daemon is down.
+- `snap latest` and `snap list` write `last_read`. `snap get` and `snap check` do not.
+- Sidecar JSON matches the fork field names.
+- Log to `~/.snap/snap.log`. Rotate at 1 MB. Do not log image bytes.
+- macOS first. Linux capture adapters exist. Windows overlay is out of v1.
 
 ## Conventions
 
-- Tauri commands use snake_case
-- JS annotation objects match the sidecar JSON schema
-- All file paths use `~/.snap/` as the root
-- Error handling: never crash silently, always log to `~/.snap/snap.log`
-- Log rotation at 1MB for both Rust and Python
-- Git commits: short, direct messages
+- CLI subcommands match the spec command surface.
+- Domain errors that callers match use `thiserror`. The binary edge uses `anyhow`.
+- Tests use a temp `HOME`. Do not touch the developer's real `~/.snap`.
+- Git commits: short, direct messages.
 
 ## Build
 
 ```bash
-make build          # Build everything
-make dev            # Run in dev mode
-npx tauri build     # Rebuild Tauri app only (must use this, not cargo build alone)
+cargo test
+cargo build --release
+make build          # cargo build --release
+make install        # copy ~/.local/bin/snap and start snap daemon
 ```
 
-Important: Always use `npx tauri build` or `make build`, never bare `cargo build`. The Tauri build embeds the frontend files into the binary. `cargo build` alone produces a binary with no frontend.
+Never `npx tauri build`. Never `cargo build` alone when you mean a release install. Use `cargo build --release` or `make build`.

@@ -4,11 +4,9 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/Desktop/snap/app/src-tauri/target/release/snap
+ExecStart=%SNAP_BIN% daemon
 Restart=on-failure
 RestartSec=3
-Environment=DISPLAY=:0
-Environment=WEBKIT_DISABLE_COMPOSITING_MODE=1
 
 [Install]
 WantedBy=default.target

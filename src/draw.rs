@@ -545,6 +545,7 @@ fn draw_annotation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_arrow(
     pixmap: &mut Pixmap,
     from: [f64; 2],
@@ -584,6 +585,7 @@ fn draw_arrow(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     pixmap: &mut Pixmap,
     font: &fontdue::Font,

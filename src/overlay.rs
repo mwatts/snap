@@ -157,6 +157,7 @@ fn crop_png_bytes(png: &[u8], crop: &Crop) -> Result<Vec<u8>, anyhow::Error> {
     Ok(buf)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn save_session(
     repo: &Path,
     capture_png: &[u8],
@@ -242,6 +243,7 @@ pub fn run_app(paths: Paths, ipc_rx: Receiver<IpcEvent>) {
         });
 }
 
+#[allow(unexpected_cfgs)]
 fn set_accessory_policy() {
     #[cfg(target_os = "macos")]
     {
@@ -559,6 +561,7 @@ struct OverlayView {
 }
 
 impl OverlayView {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         paths: Paths,
         repo: PathBuf,
@@ -887,15 +890,13 @@ impl OverlayView {
                     });
                 }
             }
-            Tool::Arrow => {
-                if (end[0] - start[0]).hypot(end[1] - start[1]) > 5.0 {
-                    self.session.items.push(SessionItem::Arrow {
-                        from: start,
-                        to: end,
-                        color: self.session.color.clone(),
-                        stroke_width: self.session.width,
-                    });
-                }
+            Tool::Arrow if (end[0] - start[0]).hypot(end[1] - start[1]) > 5.0 => {
+                self.session.items.push(SessionItem::Arrow {
+                    from: start,
+                    to: end,
+                    color: self.session.color.clone(),
+                    stroke_width: self.session.width,
+                });
             }
             _ => {}
         }
