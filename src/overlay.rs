@@ -12,7 +12,7 @@ use crate::state::{GlobalState, ProjectRegistry};
 use crate::window::{ActiveWindow, CliWindow};
 use chrono::{DateTime, Utc};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, QuitMode, Render,
@@ -34,6 +34,129 @@ pub enum IpcEvent {
     Shutdown,
 }
 
+/// Letterboxed contain-fit of a capture (`iw`×`ih`) inside a viewport (`vw`×`vh`).
+/// Matches `ObjectFit::Contain` and the fork's `computeBgLayout` (without the dpr cap).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainFit {
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub draw_w: f64,
+    pub draw_h: f64,
+    pub image_w: f64,
+    pub image_h: f64,
+}
+
+impl ContainFit {
+    pub fn new(vw: f64, vh: f64, iw: f64, ih: f64) -> Self {
+        if vw <= 0.0 || vh <= 0.0 || iw <= 0.0 || ih <= 0.0 {
+            return Self {
+                offset_x: 0.0,
+                offset_y: 0.0,
+                draw_w: 0.0,
+                draw_h: 0.0,
+                image_w: iw,
+                image_h: ih,
+            };
+        }
+        let scale = (vw / iw).min(vh / ih);
+        let draw_w = iw * scale;
+        let draw_h = ih * scale;
+        Self {
+            offset_x: ((vw - draw_w) / 2.0).round(),
+            offset_y: ((vh - draw_h) / 2.0).round(),
+            draw_w,
+            draw_h,
+            image_w: iw,
+            image_h: ih,
+        }
+    }
+
+    pub fn viewport_to_preview(&self, x: f64, y: f64) -> [f64; 2] {
+        [x - self.offset_x, y - self.offset_y]
+    }
+
+    pub fn viewport_crop_to_preview(&self, crop: &Crop) -> Crop {
+        let [x, y] = self.viewport_to_preview(crop.x, crop.y);
+        Crop {
+            x,
+            y,
+            w: crop.w,
+            h: crop.h,
+        }
+    }
+
+    pub fn preview_to_native(&self, x: f64, y: f64) -> [f64; 2] {
+        if self.draw_w == 0.0 || self.draw_h == 0.0 {
+            return [0.0, 0.0];
+        }
+        [
+            x * self.image_w / self.draw_w,
+            y * self.image_h / self.draw_h,
+        ]
+    }
+
+    pub fn viewport_to_native(&self, x: f64, y: f64) -> [f64; 2] {
+        let p = self.viewport_to_preview(x, y);
+        self.preview_to_native(p[0], p[1])
+    }
+
+    pub fn crop_dims(&self) -> CropDims {
+        CropDims {
+            preview_width: self.draw_w,
+            preview_height: self.draw_h,
+            native_width: self.image_w,
+            native_height: self.image_h,
+        }
+    }
+}
+
+fn map_session_coords(session: &Session, f: impl Fn(f64, f64) -> [f64; 2]) -> Session {
+    let mut session = session.clone();
+    for item in &mut session.items {
+        match item {
+            SessionItem::Circle { center, .. } => *center = f(center[0], center[1]),
+            SessionItem::Rect { position, .. } => *position = f(position[0], position[1]),
+            SessionItem::Arrow { from, to, .. } => {
+                *from = f(from[0], from[1]);
+                *to = f(to[0], to[1]);
+            }
+            SessionItem::Freehand { points, .. } => {
+                for p in points {
+                    let n = f(p.x, p.y);
+                    p.x = n[0];
+                    p.y = n[1];
+                }
+            }
+            SessionItem::Text { position, .. } | SessionItem::Marker { position, .. } => {
+                *position = f(position[0], position[1]);
+            }
+        }
+    }
+    session
+}
+
+fn crop_png_bytes(png: &[u8], crop: &Crop) -> Result<Vec<u8>, anyhow::Error> {
+    let img = image::load_from_memory(png)?.to_rgba8();
+    let img_w = img.width() as f64;
+    let img_h = img.height() as f64;
+    let x = crop.x.max(0.0).min(img_w);
+    let y = crop.y.max(0.0).min(img_h);
+    let w = crop.w.max(0.0).min(img_w - x);
+    let h = crop.h.max(0.0).min(img_h - y);
+    let x = x.round() as u32;
+    let y = y.round() as u32;
+    let w = w.round() as u32;
+    let h = h.round() as u32;
+    if w == 0 || h == 0 {
+        anyhow::bail!("empty crop");
+    }
+    let cropped = image::imageops::crop_imm(&img, x, y, w, h).to_image();
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgba8(cropped)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+    Ok(buf)
+}
+
 pub fn save_session(
     repo: &Path,
     capture_png: &[u8],
@@ -46,7 +169,9 @@ pub fn save_session(
 ) -> Result<PathBuf, anyhow::Error> {
     let font = include_bytes!("../assets/LiberationSans-Bold.ttf");
     let dynimg = image::load_from_memory(capture_png)?;
-    source.resolution = [dynimg.width(), dynimg.height()];
+    if source.resolution == [0, 0] {
+        source.resolution = [dynimg.width(), dynimg.height()];
+    }
     let native_crop = crop.and_then(|c| {
         map_crop_to_native(
             c,
@@ -157,6 +282,7 @@ struct Runtime {
     error: Option<WindowHandle<ErrorBanner>>,
     hotkey: Option<GlobalHotKeyManager>,
     ipc_rx: Receiver<IpcEvent>,
+    capturing: bool,
 }
 
 impl Runtime {
@@ -171,6 +297,7 @@ impl Runtime {
             error: None,
             hotkey: None,
             ipc_rx,
+            capturing: false,
         }
     }
 
@@ -185,8 +312,10 @@ impl Runtime {
                     while let Ok(ev) = rt.ipc_rx.try_recv() {
                         out.push(ev);
                     }
-                    while GlobalHotKeyEvent::receiver().try_recv().is_ok() {
-                        out.push(IpcEvent::Capture);
+                    while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+                        if ev.state == HotKeyState::Pressed {
+                            out.push(IpcEvent::Capture);
+                        }
                     }
                     out
                 });
@@ -216,7 +345,7 @@ impl Runtime {
     }
 
     fn begin_capture(&mut self, cx: &mut Context<Self>) {
-        if self.overlay.is_some() {
+        if self.overlay.is_some() || self.capturing {
             return;
         }
         let Some(repo) = self.active.clone() else {
@@ -236,7 +365,10 @@ impl Runtime {
 
         let source = CliWindow.read();
         let dest = capture_temp_path();
-        match CliCapture.capture_to(&dest) {
+        self.capturing = true;
+        let result = CliCapture.capture_to(&dest);
+        self.capturing = false;
+        match result {
             Ok(()) => match std::fs::read(&dest) {
                 Ok(bytes) => self.open_overlay(repo, bytes, dest, source, cx),
                 Err(e) => self.show_error(format!("could not read capture: {e}"), cx),
@@ -309,6 +441,9 @@ impl Runtime {
                         if let Some(handle) = rt.error.take() {
                             let _ = handle.update(cx, |_, window, _| window.remove_window());
                         }
+                        if rt.overlay.is_none() {
+                            cx.hide();
+                        }
                     });
                 })
                 .detach();
@@ -317,8 +452,9 @@ impl Runtime {
         }
     }
 
-    fn overlay_closed(&mut self) {
+    fn overlay_closed(&mut self, cx: &mut Context<Self>) {
         self.overlay = None;
+        cx.hide();
     }
 }
 
@@ -415,6 +551,9 @@ struct OverlayView {
     toolbar_pos: Option<Point<Pixels>>,
     toolbar_drag: Option<Point<Pixels>>,
     logical: [f64; 2],
+    image_w: f64,
+    image_h: f64,
+    original_layout: Option<ContainFit>,
     focus: FocusHandle,
     runtime: WeakEntity<Runtime>,
 }
@@ -433,6 +572,9 @@ impl OverlayView {
         cx: &mut Context<Self>,
     ) -> Self {
         let size = window.viewport_size();
+        let (image_w, image_h) = image::load_from_memory(&capture_png)
+            .map(|im| (im.width() as f64, im.height() as f64))
+            .unwrap_or((1.0, 1.0));
         Self {
             paths,
             repo,
@@ -450,29 +592,75 @@ impl OverlayView {
             toolbar_pos: None,
             toolbar_drag: None,
             logical: [f32::from(size.width) as f64, f32::from(size.height) as f64],
+            image_w,
+            image_h,
+            original_layout: None,
             focus: cx.focus_handle(),
             runtime,
         }
     }
 
+    fn contain_layout(&self) -> ContainFit {
+        ContainFit::new(self.logical[0], self.logical[1], self.image_w, self.image_h)
+    }
+
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(rt) = self.runtime.upgrade() {
-            rt.update(cx, |rt, _| rt.overlay_closed());
+            rt.update(cx, |rt, cx| rt.overlay_closed(cx));
         }
         window.remove_window();
     }
 
+    fn prepare_save(&self) -> Result<(Vec<u8>, Session, f64, f64, WindowSource), anyhow::Error> {
+        let mut source = self.source.clone();
+        source.resolution = [self.image_w as u32, self.image_h as u32];
+        if let Some(preview_crop) = &self.crop {
+            let layout = self
+                .original_layout
+                .clone()
+                .unwrap_or_else(|| self.contain_layout());
+            let native = map_crop_to_native(preview_crop, &layout.crop_dims())
+                .ok_or_else(|| anyhow::anyhow!("empty crop"))?;
+            let png = crop_png_bytes(&self.capture_png, &native)?;
+            Ok((
+                png,
+                self.session.clone(),
+                self.logical[0],
+                self.logical[1],
+                source,
+            ))
+        } else {
+            let layout = self.contain_layout();
+            let session =
+                map_session_coords(&self.session, |x, y| layout.viewport_to_preview(x, y));
+            let logical_w = if layout.draw_w > 0.0 {
+                layout.draw_w
+            } else {
+                self.logical[0]
+            };
+            let logical_h = if layout.draw_h > 0.0 {
+                layout.draw_h
+            } else {
+                self.logical[1]
+            };
+            Ok((
+                self.capture_png.clone(),
+                session,
+                logical_w,
+                logical_h,
+                source,
+            ))
+        }
+    }
+
     fn save_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match save_session(
-            &self.repo,
-            &self.capture_png,
-            self.crop.as_ref(),
-            self.source.clone(),
-            &self.session,
-            self.logical[0],
-            self.logical[1],
-            Utc::now(),
-        ) {
+        if self.text_pos.is_some() {
+            self.commit_text(cx);
+        }
+        let prepared = self.prepare_save();
+        match prepared.and_then(|(png, session, lw, lh, source)| {
+            save_session(&self.repo, &png, None, source, &session, lw, lh, Utc::now())
+        }) {
             Ok(path) => {
                 log_event(&self.paths, &format!("saved {}", path.display()));
                 self.close(window, cx);
@@ -647,8 +835,7 @@ impl OverlayView {
                 let w = (p[0] - start[0]).abs();
                 let h = (p[1] - start[1]).abs();
                 if w >= 10.0 && h >= 10.0 {
-                    self.crop = Some(Crop { x, y, w, h });
-                    self.selecting = false;
+                    self.commit_linux_crop(Crop { x, y, w, h });
                 }
             }
             Gesture::Shape { start, shift, .. } => self.commit_shape(start, p, shift),
@@ -714,27 +901,51 @@ impl OverlayView {
         }
     }
 
+    fn commit_linux_crop(&mut self, viewport_crop: Crop) {
+        let layout = self.contain_layout();
+        let preview = layout.viewport_crop_to_preview(&viewport_crop);
+        let Some(native) = map_crop_to_native(&preview, &layout.crop_dims()) else {
+            return;
+        };
+        if native.w < 1.0 || native.h < 1.0 {
+            return;
+        }
+        let Ok(bytes) = crop_png_bytes(&self.capture_png, &native) else {
+            return;
+        };
+        let preview_path = std::env::temp_dir().join("snap-capture-preview.png");
+        if std::fs::write(&preview_path, &bytes).is_err() {
+            return;
+        }
+        self.capture_path = preview_path;
+        self.crop = Some(preview);
+        self.original_layout = Some(layout);
+        self.selecting = false;
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.text_pos.is_none() {
             return;
         }
-        let key = ev.keystroke.key.as_str();
-        match key {
-            "enter" | "escape" => {}
+        match ev.keystroke.key.as_str() {
+            "enter" | "escape" => return,
             "backspace" => {
                 self.text_buf.pop();
                 cx.notify();
                 cx.stop_propagation();
+                return;
             }
-            k if k.chars().count() == 1
-                && !ev.keystroke.modifiers.control
-                && !ev.keystroke.modifiers.platform =>
-            {
-                self.text_buf.push_str(k);
+            _ => {}
+        }
+        if ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform {
+            return;
+        }
+        if let Some(ch) = ev.keystroke.key_char.as_deref() {
+            if !ch.is_empty() {
+                self.text_buf.push_str(ch);
                 cx.notify();
                 cx.stop_propagation();
             }
-            _ => {}
         }
     }
 }
@@ -1086,7 +1297,11 @@ impl Render for OverlayView {
             .child(
                 img(capture_path)
                     .size_full()
-                    .object_fit(gpui::ObjectFit::Contain),
+                    .object_fit(if self.crop.is_some() {
+                        gpui::ObjectFit::Fill
+                    } else {
+                        gpui::ObjectFit::Contain
+                    }),
             )
             .when(dim, |el| {
                 el.child(div().absolute().inset_0().bg(rgb(0x000000).opacity(0.3)))
@@ -1180,6 +1395,8 @@ impl OverlayView {
             .bg(rgb(0x121214).opacity(0.94))
             .border_1()
             .border_color(rgb(0x333333))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(self.drag_handle(cx))
             .child(self.tool_btn("C", Tool::Circle, tool, cx))
             .child(self.tool_btn("R", Tool::Rect, tool, cx))
@@ -1376,5 +1593,121 @@ mod tests {
             rec.annotations[0],
             Annotation::Marker { number: 1, .. }
         ));
+    }
+
+    #[test]
+    fn contain_fit_letterboxes_mismatched_aspect() {
+        let fit = ContainFit::new(200.0, 100.0, 100.0, 100.0);
+        assert_eq!(fit.offset_x, 50.0);
+        assert_eq!(fit.offset_y, 0.0);
+        assert_eq!(fit.draw_w, 100.0);
+        assert_eq!(fit.draw_h, 100.0);
+        assert_eq!(fit.viewport_to_preview(50.0, 0.0), [0.0, 0.0]);
+        assert_eq!(fit.viewport_to_preview(150.0, 100.0), [100.0, 100.0]);
+        assert_eq!(fit.viewport_to_native(100.0, 50.0), [50.0, 50.0]);
+    }
+
+    #[test]
+    fn contain_fit_maps_viewport_crop_to_native() {
+        let fit = ContainFit::new(400.0, 400.0, 400.0, 200.0);
+        assert_eq!(fit.offset_x, 0.0);
+        assert_eq!(fit.offset_y, 100.0);
+        assert_eq!(fit.draw_w, 400.0);
+        assert_eq!(fit.draw_h, 200.0);
+        let viewport_crop = Crop {
+            x: 50.0,
+            y: 150.0,
+            w: 100.0,
+            h: 50.0,
+        };
+        let preview = fit.viewport_crop_to_preview(&viewport_crop);
+        assert_eq!(
+            preview,
+            Crop {
+                x: 50.0,
+                y: 50.0,
+                w: 100.0,
+                h: 50.0
+            }
+        );
+        let native = map_crop_to_native(&preview, &fit.crop_dims()).unwrap();
+        assert_eq!(
+            native,
+            Crop {
+                x: 50.0,
+                y: 50.0,
+                w: 100.0,
+                h: 50.0
+            }
+        );
+    }
+
+    #[test]
+    fn contain_fit_scales_preview_crop_when_image_is_larger() {
+        let fit = ContainFit::new(200.0, 100.0, 400.0, 200.0);
+        assert_eq!(fit.offset_x, 0.0);
+        assert_eq!(fit.offset_y, 0.0);
+        assert_eq!(fit.draw_w, 200.0);
+        let preview = fit.viewport_crop_to_preview(&Crop {
+            x: 20.0,
+            y: 10.0,
+            w: 40.0,
+            h: 20.0,
+        });
+        let native = map_crop_to_native(&preview, &fit.crop_dims()).unwrap();
+        assert_eq!(
+            native,
+            Crop {
+                x: 40.0,
+                y: 20.0,
+                w: 80.0,
+                h: 40.0
+            }
+        );
+    }
+
+    #[test]
+    fn save_session_uses_contain_fit_preview_coords_not_viewport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".snap/inbox")).unwrap();
+        let mut img = image::RgbaImage::new(8, 4);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([0, 0, 255, 255]);
+        }
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+
+        let fit = ContainFit::new(8.0, 8.0, 8.0, 4.0);
+        assert_eq!(fit.offset_y, 2.0);
+        let [px, py] = fit.viewport_to_preview(4.0, 4.0);
+        assert_eq!([px, py], [4.0, 2.0]);
+
+        let mut session = Session::new();
+        session.add_marker(4.0, 4.0);
+        let mapped = map_session_coords(&session, |x, y| fit.viewport_to_preview(x, y));
+        save_session(
+            &repo,
+            &buf,
+            None,
+            WindowSource::default(),
+            &mapped,
+            fit.draw_w,
+            fit.draw_h,
+            Utc::now(),
+        )
+        .unwrap();
+        let rec = Inbox::new(repo.join(".snap")).latest(false).unwrap();
+        match &rec.annotations[0] {
+            Annotation::Marker {
+                position, number, ..
+            } => {
+                assert_eq!(*number, 1);
+                assert_eq!(*position, [4.0, 2.0]);
+            }
+            other => panic!("expected marker, got {other:?}"),
+        }
     }
 }
