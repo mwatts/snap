@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod cli;
 pub mod daemon;
 pub mod draw;
@@ -8,3 +9,4 @@ pub mod paths;
 pub mod project;
 pub mod schema;
 pub mod state;
+pub mod window;
