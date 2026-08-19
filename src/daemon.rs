@@ -1,5 +1,6 @@
-use crate::ipc::{read_request, send_request, write_response, Request, Response};
+use crate::ipc::{Request, Response, read_request, send_request, write_response};
 use crate::logutil::log_event;
+use crate::overlay::{self, IpcEvent};
 use crate::paths::Paths;
 use crate::state::GlobalState;
 use std::fs;
@@ -7,6 +8,7 @@ use std::io::BufReader;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 
 pub fn pid_is_alive(pid: u32) -> bool {
     Command::new("kill")
@@ -62,6 +64,18 @@ pub fn serve(paths: Paths) -> Result<(), anyhow::Error> {
     fs::write(&paths.pid, format!("{}\n", std::process::id()))?;
     log_event(&paths, "daemon listening");
 
+    let (tx, rx) = mpsc::channel();
+    let paths_sock = paths.clone();
+    std::thread::spawn(move || socket_loop(paths_sock, listener, tx));
+    overlay::run_app(paths.clone(), rx);
+
+    let _ = fs::remove_file(&paths.sock);
+    let _ = fs::remove_file(&paths.pid);
+    log_event(&paths, "daemon stopped");
+    Ok(())
+}
+
+fn socket_loop(paths: Paths, listener: UnixListener, tx: mpsc::Sender<IpcEvent>) {
     let mut active_project = GlobalState::load(&paths.state)
         .unwrap_or_default()
         .active_project;
@@ -83,7 +97,7 @@ pub fn serve(paths: Paths) -> Result<(), anyhow::Error> {
             }
         };
         let shutdown = matches!(req, Request::Shutdown);
-        let resp = handle(&paths, &mut active_project, req);
+        let resp = handle(&paths, &mut active_project, &tx, req);
         let _ = write_response(reader.get_mut(), &resp);
         if shutdown {
             break;
@@ -92,16 +106,29 @@ pub fn serve(paths: Paths) -> Result<(), anyhow::Error> {
 
     let _ = fs::remove_file(&paths.sock);
     let _ = fs::remove_file(&paths.pid);
-    log_event(&paths, "daemon stopped");
-    Ok(())
 }
 
-fn handle(paths: &Paths, active: &mut Option<PathBuf>, req: Request) -> Response {
+fn handle(
+    paths: &Paths,
+    active: &mut Option<PathBuf>,
+    tx: &mpsc::Sender<IpcEvent>,
+    req: Request,
+) -> Response {
     match req {
         Request::Ping => Response::ok(serde_json::json!({})),
         Request::Capture => {
-            log_event(paths, "capture: overlay not implemented");
-            Response::err("overlay not implemented")
+            if !active
+                .as_ref()
+                .is_some_and(|repo| repo.join(".snap").join("config.toml").is_file())
+            {
+                log_event(paths, "capture: last-active has no .snap/config.toml");
+                return Response::err("no active project");
+            }
+            if let Err(e) = tx.send(IpcEvent::Capture) {
+                return Response::err(e.to_string());
+            }
+            log_event(paths, "capture");
+            Response::ok(serde_json::json!({}))
         }
         Request::Use { path } => {
             let repo = PathBuf::from(path);
@@ -113,6 +140,7 @@ fn handle(paths: &Paths, active: &mut Option<PathBuf>, req: Request) -> Response
             {
                 return Response::err(e.to_string());
             }
+            let _ = tx.send(IpcEvent::Use(repo.clone()));
             log_event(paths, &format!("use {}", repo.display()));
             Response::ok(serde_json::json!({}))
         }
@@ -125,11 +153,14 @@ fn handle(paths: &Paths, active: &mut Option<PathBuf>, req: Request) -> Response
                 "socket": paths.sock,
             }))
         }
-        Request::Shutdown => Response::ok(serde_json::json!({})),
+        Request::Shutdown => {
+            let _ = tx.send(IpcEvent::Shutdown);
+            Response::ok(serde_json::json!({}))
+        }
     }
 }
 
-fn project_name(repo: &Path) -> String {
+pub(crate) fn project_name(repo: &Path) -> String {
     let cfg = repo.join(".snap").join("config.toml");
     if let Ok(text) = fs::read_to_string(cfg) {
         if let Ok(val) = text.parse::<toml::Value>() {

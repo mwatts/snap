@@ -5,6 +5,7 @@ pub mod draw;
 pub mod inbox;
 pub mod ipc;
 pub mod logutil;
+pub mod overlay;
 pub mod paths;
 pub mod project;
 pub mod schema;
