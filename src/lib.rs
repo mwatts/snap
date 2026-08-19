@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod daemon;
+pub mod draw;
 pub mod inbox;
 pub mod ipc;
 pub mod logutil;
