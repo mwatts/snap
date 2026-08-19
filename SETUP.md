@@ -114,7 +114,7 @@ The daemon needs Screen Recording and Accessibility.
 3. Allow **Screen Recording** if macOS asks.
 4. Allow **Accessibility** if macOS asks.
 
-If a prompt never appears, open System Settings > Privacy & Security and add `snap` by hand.
+If a prompt never appears, open System Settings > Privacy & Security and add `~/.local/bin/snap` by hand.
 
 If Screen Recording is missing, `snap doctor` prints:
 
@@ -122,10 +122,23 @@ If Screen Recording is missing, `snap doctor` prints:
 Screen Recording permission is missing. Enable it in System Settings > Privacy & Security > Screen Recording.
 ```
 
-If permissions get stuck:
+If permissions get stuck, TCC for this unsigned CLI keys off the executable path. `com.adjective.snap` is the launchd label only. `dev.snap.snap` is the overlay identity only. A bundle-id reset will not fix the CLI.
+
+Stop the daemon, rebuild, and reinstall so the binary at `~/.local/bin/snap` is current:
 
 ```bash
-tccutil reset All com.adjective.snap
+snap stop
+make install
+```
+
+Then re-grant **Screen Recording** and **Accessibility** for `~/.local/bin/snap` in System Settings > Privacy & Security.
+
+If the prompts still do not appear, reset those services (this resets every app for that service) and grant `~/.local/bin/snap` again:
+
+```bash
+tccutil reset ScreenCapture
+tccutil reset Accessibility
+tccutil reset AppleEvents
 snap start
 ```
 
