@@ -208,7 +208,6 @@ pub fn map_crop_to_native(crop: &Crop, dims: &CropDims) -> Option<Crop> {
     Some(Crop { x, y, w, h })
 }
 
-const DEFAULT_STROKE: f32 = 4.0;
 const MARKER_RADIUS: f64 = 16.0;
 const TEXT_SIZE: f32 = 16.0;
 const TEXT_STROKE_PX: f32 = 3.0;
@@ -224,14 +223,15 @@ pub enum DrawError {
     Invalid(String),
 }
 
-/// Composite capture PNG + annotations at export resolution.
+/// Composite capture PNG + session items at export resolution.
 ///
+/// Stroke width comes from each `SessionItem` (sidecar JSON has no width field).
 /// `crop` is already native pixels (caller mapped). `logical_w` / `logical_h`
 /// are overlay coordinates; scale is `export / logical`.
 pub fn composite_png(
     capture_png: &[u8],
     crop: Option<&Crop>,
-    annotations: &[Annotation],
+    items: &[SessionItem],
     logical_w: f64,
     logical_h: f64,
     font: &[u8],
@@ -265,7 +265,7 @@ pub fn composite_png(
         .ok_or_else(|| DrawError::Invalid("could not allocate pixmap".into()))?;
     copy_image_to_pixmap(&img, &mut pixmap);
 
-    let face = if needs_font(annotations) {
+    let face = if needs_font(items) {
         Some(
             fontdue::Font::from_bytes(font, fontdue::FontSettings::default())
                 .map_err(|e| DrawError::Invalid(e.to_string()))?,
@@ -274,17 +274,17 @@ pub fn composite_png(
         None
     };
 
-    for ann in annotations {
-        draw_annotation(&mut pixmap, ann, sx, sy, scale, face.as_ref());
+    for item in items {
+        draw_item(&mut pixmap, item, sx, sy, scale, face.as_ref());
     }
 
     encode_png(&pixmap)
 }
 
-fn needs_font(annotations: &[Annotation]) -> bool {
-    annotations
+fn needs_font(items: &[SessionItem]) -> bool {
+    items
         .iter()
-        .any(|a| matches!(a, Annotation::Text { .. } | Annotation::Marker { .. }))
+        .any(|a| matches!(a, SessionItem::Text { .. } | SessionItem::Marker { .. }))
 }
 
 fn apply_native_crop(img: &image::RgbaImage, crop: &Crop) -> Result<image::RgbaImage, DrawError> {
@@ -394,22 +394,22 @@ fn norm_rect(x: f32, y: f32, w: f32, h: f32) -> Option<Rect> {
     Rect::from_xywh(x, y, w, h)
 }
 
-fn draw_annotation(
+fn draw_item(
     pixmap: &mut Pixmap,
-    ann: &Annotation,
+    item: &SessionItem,
     sx: f64,
     sy: f64,
     scale: f32,
     font: Option<&fontdue::Font>,
 ) {
-    let stroke_w = DEFAULT_STROKE * scale;
-    match ann {
-        Annotation::Circle {
+    match item {
+        SessionItem::Circle {
             center,
             radius,
             color,
-            ..
+            stroke_width,
         } => {
+            let stroke_w = *stroke_width * scale;
             let rx = radius[0].abs() * sx;
             let ry = radius[1].abs() * sy;
             let Some(rect) = Rect::from_xywh(
@@ -426,12 +426,13 @@ fn draw_annotation(
                 stroke_path(pixmap, &path, parse_color(color), stroke_w);
             }
         }
-        Annotation::Rect {
+        SessionItem::Rect {
             position,
             size,
             color,
-            ..
+            stroke_width,
         } => {
+            let stroke_w = *stroke_width * scale;
             let Some(rect) = norm_rect(
                 (position[0] * sx) as f32,
                 (position[1] * sy) as f32,
@@ -451,24 +452,32 @@ fn draw_annotation(
                 stroke_path(pixmap, &path, parse_color(color), stroke_w);
             }
         }
-        Annotation::Arrow {
-            from, to, color, ..
+        SessionItem::Arrow {
+            from,
+            to,
+            color,
+            stroke_width,
         } => {
             draw_arrow(
                 pixmap,
                 *from,
                 *to,
                 parse_color(color),
-                stroke_w,
+                *stroke_width * scale,
                 sx,
                 sy,
                 scale,
             );
         }
-        Annotation::Freehand { points, color, .. } => {
+        SessionItem::Freehand {
+            points,
+            color,
+            stroke_width,
+        } => {
             if points.len() < 2 {
                 return;
             }
+            let stroke_w = *stroke_width * scale;
             let mut pb = PathBuilder::new();
             pb.move_to((points[0].x * sx) as f32, (points[0].y * sy) as f32);
             if points.len() == 2 {
@@ -491,7 +500,7 @@ fn draw_annotation(
                 stroke_path(pixmap, &path, parse_color(color), stroke_w);
             }
         }
-        Annotation::Text {
+        SessionItem::Text {
             position,
             content,
             color,
@@ -516,7 +525,7 @@ fn draw_annotation(
             }
             draw_text(pixmap, font, content, x, y, px, parse_color(color), false);
         }
-        Annotation::Marker {
+        SessionItem::Marker {
             position,
             number,
             color,
@@ -567,7 +576,7 @@ fn draw_arrow(
         stroke_path(pixmap, &path, color, stroke_w);
     }
 
-    let head_len = (12.0 + DEFAULT_STROKE) * scale;
+    let head_len = 12.0 * scale + stroke_w;
     let angle = (y2 - y1).atan2(x2 - x1);
     let mut head = PathBuilder::new();
     head.move_to(x2, y2);
@@ -805,11 +814,11 @@ mod tests {
         let out = composite_png(
             &buf,
             None,
-            &[Annotation::Circle {
+            &[SessionItem::Circle {
                 center: [2.0, 2.0],
                 radius: [1.0, 1.0],
                 color: "#000000".into(),
-                label: None,
+                stroke_width: 4.0,
             }],
             4.0,
             4.0,
@@ -818,5 +827,38 @@ mod tests {
         .unwrap();
         assert_eq!(&out[..8], b"\x89PNG\r\n\x1a\n");
         assert!(out.len() > buf.len() / 2);
+    }
+
+    fn solid_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut img = image::RgbaImage::new(w, h);
+        for p in img.pixels_mut() {
+            *p = image::Rgba(rgba);
+        }
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn composite_honors_stroke_width() {
+        let buf = solid_png(48, 48, [255, 255, 255, 255]);
+        let font = include_bytes!("../assets/LiberationSans-Bold.ttf");
+        let item = |width: f32| SessionItem::Rect {
+            position: [8.0, 8.0],
+            size: [32.0, 32.0],
+            color: "#000000".into(),
+            stroke_width: width,
+        };
+        let thin = composite_png(&buf, None, &[item(2.0)], 48.0, 48.0, font).unwrap();
+        let thick = composite_png(&buf, None, &[item(6.0)], 48.0, 48.0, font).unwrap();
+        let a = image::load_from_memory(&thin).unwrap().to_rgba8();
+        let b = image::load_from_memory(&thick).unwrap().to_rgba8();
+        let different = a.pixels().zip(b.pixels()).filter(|(p, q)| p != q).count();
+        assert!(
+            different > 0,
+            "2px and 6px strokes must produce different pixels"
+        );
     }
 }

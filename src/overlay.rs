@@ -187,7 +187,7 @@ pub fn save_session(
     let png = composite_png(
         capture_png,
         native_crop.as_ref(),
-        &session.to_annotations(),
+        &session.items,
         logical_w,
         logical_h,
         font,
@@ -536,6 +536,77 @@ enum Gesture {
     },
 }
 
+fn commit_freehand(session: &mut Session, points: Vec<InkPoint>) {
+    if points.len() >= 2 {
+        let simplified = simplify_points(&points, 2.0);
+        session.items.push(SessionItem::Freehand {
+            points: simplified,
+            color: session.color.clone(),
+            stroke_width: session.width,
+        });
+    }
+}
+
+fn commit_shape(session: &mut Session, start: [f64; 2], end: [f64; 2], shift: bool) {
+    match session.tool {
+        Tool::Circle => {
+            let rx = (end[0] - start[0]).abs() / 2.0;
+            let ry = if shift {
+                rx
+            } else {
+                (end[1] - start[1]).abs() / 2.0
+            };
+            if rx > 2.0 || ry > 2.0 {
+                session.items.push(SessionItem::Circle {
+                    center: [
+                        start[0] + (end[0] - start[0]) / 2.0,
+                        start[1] + (end[1] - start[1]) / 2.0,
+                    ],
+                    radius: [rx, ry],
+                    color: session.color.clone(),
+                    stroke_width: session.width,
+                });
+            }
+        }
+        Tool::Rect => {
+            let w = end[0] - start[0];
+            let h = if shift { w } else { end[1] - start[1] };
+            if w.abs() > 2.0 || h.abs() > 2.0 {
+                session.items.push(SessionItem::Rect {
+                    position: start,
+                    size: [w, h],
+                    color: session.color.clone(),
+                    stroke_width: session.width,
+                });
+            }
+        }
+        Tool::Arrow if (end[0] - start[0]).hypot(end[1] - start[1]) > 5.0 => {
+            session.items.push(SessionItem::Arrow {
+                from: start,
+                to: end,
+                color: session.color.clone(),
+                stroke_width: session.width,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn apply_ink_up(session: &mut Session, gesture: Gesture, end: [f64; 2]) {
+    match gesture {
+        Gesture::Shape { start, shift, .. } => commit_shape(session, start, end, shift),
+        Gesture::Freehand { points } => commit_freehand(session, points),
+        Gesture::Select { .. } | Gesture::None => {}
+    }
+}
+
+fn toolbar_drag_origin(
+    stored: Option<Point<Pixels>>,
+    measured: Option<Point<Pixels>>,
+) -> Point<Pixels> {
+    stored.or(measured).unwrap_or(point(px(0.), px(16.)))
+}
+
 struct OverlayView {
     paths: Paths,
     repo: PathBuf,
@@ -551,6 +622,7 @@ struct OverlayView {
     text_buf: String,
     banner: Option<String>,
     toolbar_pos: Option<Point<Pixels>>,
+    toolbar_origin: Option<Point<Pixels>>,
     toolbar_drag: Option<Point<Pixels>>,
     logical: [f64; 2],
     image_w: f64,
@@ -593,6 +665,7 @@ impl OverlayView {
             text_buf: String::new(),
             banner: None,
             toolbar_pos: None,
+            toolbar_origin: None,
             toolbar_drag: None,
             logical: [f32::from(size.width) as f64, f32::from(size.height) as f64],
             image_w,
@@ -841,65 +914,9 @@ impl OverlayView {
                     self.commit_linux_crop(Crop { x, y, w, h });
                 }
             }
-            Gesture::Shape { start, shift, .. } => self.commit_shape(start, p, shift),
-            Gesture::Freehand { points } => {
-                if points.len() > 2 {
-                    let simplified = simplify_points(&points, 2.0);
-                    self.session.items.push(SessionItem::Freehand {
-                        points: simplified,
-                        color: self.session.color.clone(),
-                        stroke_width: self.session.width,
-                    });
-                }
-            }
-            Gesture::None => {}
+            other => apply_ink_up(&mut self.session, other, p),
         }
         cx.notify();
-    }
-
-    fn commit_shape(&mut self, start: [f64; 2], end: [f64; 2], shift: bool) {
-        match self.session.tool {
-            Tool::Circle => {
-                let rx = (end[0] - start[0]).abs() / 2.0;
-                let ry = if shift {
-                    rx
-                } else {
-                    (end[1] - start[1]).abs() / 2.0
-                };
-                if rx > 2.0 || ry > 2.0 {
-                    self.session.items.push(SessionItem::Circle {
-                        center: [
-                            start[0] + (end[0] - start[0]) / 2.0,
-                            start[1] + (end[1] - start[1]) / 2.0,
-                        ],
-                        radius: [rx, ry],
-                        color: self.session.color.clone(),
-                        stroke_width: self.session.width,
-                    });
-                }
-            }
-            Tool::Rect => {
-                let w = end[0] - start[0];
-                let h = if shift { w } else { end[1] - start[1] };
-                if w.abs() > 2.0 || h.abs() > 2.0 {
-                    self.session.items.push(SessionItem::Rect {
-                        position: start,
-                        size: [w, h],
-                        color: self.session.color.clone(),
-                        stroke_width: self.session.width,
-                    });
-                }
-            }
-            Tool::Arrow if (end[0] - start[0]).hypot(end[1] - start[1]) > 5.0 => {
-                self.session.items.push(SessionItem::Arrow {
-                    from: start,
-                    to: end,
-                    color: self.session.color.clone(),
-                    stroke_width: self.session.width,
-                });
-            }
-            _ => {}
-        }
     }
 
     fn commit_linux_crop(&mut self, viewport_crop: Crop) {
@@ -1397,7 +1414,13 @@ impl OverlayView {
             .border_1()
             .border_color(rgb(0x333333))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, ev, window, cx| {
+                    this.on_up(ev, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(self.drag_handle(cx))
             .child(self.tool_btn("C", Tool::Circle, tool, cx))
             .child(self.tool_btn("R", Tool::Rect, tool, cx))
@@ -1445,15 +1468,23 @@ impl OverlayView {
                 .top(p.y)
                 .child(bar)
                 .into_any_element(),
-            None => div()
-                .absolute()
-                .top(px(16.))
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
-                .child(bar)
-                .into_any_element(),
+            None => {
+                let entity = cx.entity();
+                div()
+                    .absolute()
+                    .top(px(16.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .on_children_prepainted(move |kids, _, cx| {
+                        if let Some(b) = kids.first() {
+                            entity.update(cx, |this, _| this.toolbar_origin = Some(b.origin));
+                        }
+                    })
+                    .child(bar)
+                    .into_any_element()
+            }
         }
     }
 
@@ -1467,7 +1498,7 @@ impl OverlayView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    let origin = this.toolbar_pos.unwrap_or(point(px(0.), px(16.)));
+                    let origin = toolbar_drag_origin(this.toolbar_pos, this.toolbar_origin);
                     this.toolbar_drag =
                         Some(point(ev.position.x - origin.x, ev.position.y - origin.y));
                     cx.stop_propagation();
@@ -1710,5 +1741,129 @@ mod tests {
             }
             other => panic!("expected marker, got {other:?}"),
         }
+    }
+
+    fn solid_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut img = image::RgbaImage::new(w, h);
+        for p in img.pixels_mut() {
+            *p = image::Rgba(rgba);
+        }
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn save_session_png_honors_stroke_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".snap/inbox")).unwrap();
+        let buf = solid_png(48, 48, [255, 255, 255, 255]);
+        let item = |width: f32| SessionItem::Rect {
+            position: [8.0, 8.0],
+            size: [32.0, 32.0],
+            color: "#000000".into(),
+            stroke_width: width,
+        };
+        let mut thin = Session::new();
+        thin.items.push(item(2.0));
+        let mut thick = Session::new();
+        thick.items.push(item(6.0));
+        let t2 = DateTime::parse_from_rfc3339("2026-08-18T14:20:15.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t6 = DateTime::parse_from_rfc3339("2026-08-18T14:20:15.001Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let p2 = save_session(
+            &repo,
+            &buf,
+            None,
+            WindowSource::default(),
+            &thin,
+            48.0,
+            48.0,
+            t2,
+        )
+        .unwrap();
+        let p6 = save_session(
+            &repo,
+            &buf,
+            None,
+            WindowSource::default(),
+            &thick,
+            48.0,
+            48.0,
+            t6,
+        )
+        .unwrap();
+        let png2 = std::fs::read(&p2).unwrap();
+        let png6 = std::fs::read(&p6).unwrap();
+        let a = image::load_from_memory(&png2).unwrap().to_rgba8();
+        let b = image::load_from_memory(&png6).unwrap().to_rgba8();
+        let different = a.pixels().zip(b.pixels()).filter(|(p, q)| p != q).count();
+        assert!(
+            different > 0,
+            "2px and 6px strokes must produce different pixels"
+        );
+        let json = std::fs::read_to_string(p2.with_extension("json")).unwrap();
+        assert!(
+            !json.contains("stroke_width"),
+            "sidecar must omit stroke width"
+        );
+    }
+
+    #[test]
+    fn freehand_commits_at_two_points() {
+        let mut session = Session::new();
+        commit_freehand(
+            &mut session,
+            vec![InkPoint { x: 0.0, y: 0.0 }, InkPoint { x: 4.0, y: 0.0 }],
+        );
+        assert_eq!(session.items.len(), 1);
+        session.clear();
+        commit_freehand(&mut session, vec![InkPoint { x: 0.0, y: 0.0 }]);
+        assert!(session.items.is_empty());
+    }
+
+    #[test]
+    fn live_stroke_commits_when_pointer_up_hits_toolbar() {
+        let mut session = Session::new();
+        session.tool = Tool::Arrow;
+        apply_ink_up(
+            &mut session,
+            Gesture::Shape {
+                start: [10.0, 10.0],
+                end: [40.0, 10.0],
+                shift: false,
+            },
+            [40.0, 10.0],
+        );
+        assert_eq!(session.items.len(), 1);
+        session.tool = Tool::Freehand;
+        apply_ink_up(
+            &mut session,
+            Gesture::Freehand {
+                points: vec![InkPoint { x: 1.0, y: 1.0 }, InkPoint { x: 8.0, y: 8.0 }],
+            },
+            [8.0, 8.0],
+        );
+        assert_eq!(session.items.len(), 2);
+    }
+
+    #[test]
+    fn first_toolbar_drag_uses_measured_centered_origin() {
+        let measured = point(px(480.), px(16.));
+        assert_eq!(toolbar_drag_origin(None, Some(measured)), measured);
+        assert_ne!(
+            toolbar_drag_origin(None, Some(measured)),
+            point(px(0.), px(16.))
+        );
+        assert_eq!(
+            toolbar_drag_origin(Some(point(px(10.), px(20.))), Some(measured)),
+            point(px(10.), px(20.))
+        );
     }
 }

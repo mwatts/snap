@@ -1,6 +1,10 @@
 use crate::schema::WindowSource;
 use std::process::Command;
 
+fn parse_unix_id(s: &str) -> Option<u32> {
+    s.trim().parse().ok()
+}
+
 pub trait ActiveWindow {
     fn read(&self) -> WindowSource;
 }
@@ -82,11 +86,16 @@ fn macos_window() -> WindowSource {
         None
     };
 
+    let pid = osascript(
+        "tell application \"System Events\" to get unix id of first process whose frontmost is true",
+    )
+    .and_then(|s| parse_unix_id(&s));
+
     WindowSource {
         window_title: window_title.or_else(|| app_name.clone()),
         url,
         window_class: app_name,
-        pid: None,
+        pid,
         display: "primary".into(),
         resolution: [0, 0],
     }
@@ -157,5 +166,19 @@ mod tests {
         let src = Fake.read();
         assert_eq!(src.display, "primary");
         assert_eq!(src.resolution, [0, 0]);
+    }
+
+    #[test]
+    fn parse_unix_id_reads_osascript_stdout() {
+        assert_eq!(parse_unix_id("12345"), Some(12345));
+        assert_eq!(parse_unix_id(" 99 \n"), Some(99));
+        assert_eq!(parse_unix_id("missing"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pid_script_requests_frontmost_unix_id() {
+        let src = include_str!("window.rs");
+        assert!(src.contains("unix id of first process whose frontmost is true"));
     }
 }
