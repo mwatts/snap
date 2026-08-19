@@ -1,8 +1,11 @@
+use crate::daemon;
 use crate::inbox::{Inbox, InboxError};
+use crate::ipc::{send_request, IpcError, Request, Response};
 use crate::paths::Paths;
 use crate::project::{find_git_root, init_project, resolve_repo, set_active};
 use crate::state::{GlobalState, ProjectRegistry};
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -60,12 +63,12 @@ fn run_inner() -> anyhow::Result<ExitCode> {
         Commands::List { last_n } => agent(|inbox| inbox.list(last_n.unwrap_or(5), true)),
         Commands::Get { id } => agent(|inbox| inbox.get(&id)),
         Commands::Clear => agent(|inbox| inbox.clear()),
-        Commands::Daemon
-        | Commands::Start
-        | Commands::Stop
-        | Commands::Status
-        | Commands::Doctor
-        | Commands::Capture => Ok(daemon_not_implemented()),
+        Commands::Daemon => cmd_daemon(),
+        Commands::Start => cmd_start(),
+        Commands::Stop => cmd_stop(),
+        Commands::Status => cmd_status(),
+        Commands::Capture => cmd_capture(),
+        Commands::Doctor => Ok(daemon_not_implemented()),
     }
 }
 
@@ -128,6 +131,109 @@ fn agent_error(err: impl std::fmt::Display) -> ExitCode {
     println!("{}", serde_json::json!({ "error": msg }));
     eprintln!("{msg}");
     ExitCode::from(1)
+}
+
+fn cmd_daemon() -> anyhow::Result<ExitCode> {
+    let paths = Paths::discover()?;
+    daemon::serve(paths)?;
+    Ok(ExitCode::from(0))
+}
+
+fn cmd_start() -> anyhow::Result<ExitCode> {
+    let paths = Paths::discover()?;
+    daemon::start_detached(&paths)?;
+    Ok(ExitCode::from(0))
+}
+
+fn cmd_stop() -> anyhow::Result<ExitCode> {
+    let paths = Paths::discover()?;
+    match send_request(&paths.sock, &Request::Shutdown) {
+        Ok(_) => Ok(ExitCode::from(0)),
+        Err(IpcError::NotRunning) => {
+            let dead = match fs::read_to_string(&paths.pid) {
+                Ok(s) => s
+                    .trim()
+                    .parse::<u32>()
+                    .map(|pid| !daemon::pid_is_alive(pid))
+                    .unwrap_or(true),
+                Err(_) => true,
+            };
+            if dead {
+                let _ = fs::remove_file(&paths.sock);
+                let _ = fs::remove_file(&paths.pid);
+            }
+            Ok(ExitCode::from(0))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn cmd_status() -> anyhow::Result<ExitCode> {
+    let paths = Paths::discover()?;
+    match send_request(&paths.sock, &Request::Status) {
+        Ok(resp) if resp.ok => {
+            print_status(&resp);
+            Ok(ExitCode::from(0))
+        }
+        Ok(resp) => {
+            eprintln!("{}", resp.error.as_deref().unwrap_or("status failed"));
+            Ok(ExitCode::from(1))
+        }
+        Err(IpcError::NotRunning) => {
+            eprintln!("daemon is not running");
+            Ok(ExitCode::from(1))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn cmd_capture() -> anyhow::Result<ExitCode> {
+    let paths = Paths::discover()?;
+    match send_request(&paths.sock, &Request::Capture) {
+        Ok(resp) => {
+            println!("{}", serde_json::to_string(&resp)?);
+            if resp.ok {
+                Ok(ExitCode::from(0))
+            } else {
+                if let Some(err) = &resp.error {
+                    eprintln!("{err}");
+                }
+                Ok(ExitCode::from(1))
+            }
+        }
+        Err(IpcError::NotRunning) => {
+            eprintln!("daemon is not running");
+            Ok(ExitCode::from(1))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn print_status(resp: &Response) {
+    let data = resp.data.clone().unwrap_or(serde_json::json!({}));
+    let pid = data
+        .get("pid")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".into());
+    let socket = data.get("socket").and_then(|v| v.as_str()).unwrap_or("-");
+    let active = match data.get("active_project").and_then(|v| v.as_str()) {
+        Some(path) => {
+            let name = data
+                .get("active_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path} ({name})")
+            }
+        }
+        None => "none".into(),
+    };
+    println!("pid: {pid}");
+    println!("active: {active}");
+    println!("socket: {socket}");
 }
 
 fn daemon_not_implemented() -> ExitCode {

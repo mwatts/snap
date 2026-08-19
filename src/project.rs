@@ -64,7 +64,17 @@ pub fn set_active(paths: &Paths, repo: &Path) -> Result<(), StateError> {
     let state = GlobalState {
         active_project: Some(repo.to_path_buf()),
     };
-    state.save(&paths.state)
+    state.save(&paths.state)?;
+    match crate::ipc::send_request(
+        &paths.sock,
+        &crate::ipc::Request::Use {
+            path: repo.to_string_lossy().into_owned(),
+        },
+    ) {
+        Ok(_) | Err(crate::ipc::IpcError::NotRunning) => {}
+        Err(e) => crate::logutil::log_event(paths, &format!("notify use: {e}")),
+    }
+    Ok(())
 }
 
 pub fn upsert_project(
@@ -185,9 +195,17 @@ mod tests {
         let repo_a = tmp.path().join("a");
         let repo_b = tmp.path().join("b");
         fs::create_dir_all(repo_a.join(".snap")).unwrap();
-        fs::write(repo_a.join(".snap/config.toml"), "[project]\nname = \"a\"\n").unwrap();
+        fs::write(
+            repo_a.join(".snap/config.toml"),
+            "[project]\nname = \"a\"\n",
+        )
+        .unwrap();
         fs::create_dir_all(repo_b.join(".snap")).unwrap();
-        fs::write(repo_b.join(".snap/config.toml"), "[project]\nname = \"b\"\n").unwrap();
+        fs::write(
+            repo_b.join(".snap/config.toml"),
+            "[project]\nname = \"b\"\n",
+        )
+        .unwrap();
         set_active(&paths, &repo_b).unwrap();
         let got = resolve_repo(&repo_a, &paths).unwrap();
         assert_eq!(got, repo_a);
