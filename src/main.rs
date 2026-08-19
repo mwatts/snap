@@ -1,3 +1,3 @@
-fn main() {
-    println!("snap");
+fn main() -> std::process::ExitCode {
+    snap::cli::run()
 }

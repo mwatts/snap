@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod inbox;
 pub mod logutil;
 pub mod paths;
