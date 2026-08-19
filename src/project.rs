@@ -1,7 +1,11 @@
 use crate::paths::Paths;
 use crate::state::{GlobalState, ProjectEntry, ProjectRegistry, StateError};
 use chrono::{DateTime, SecondsFormat, Utc};
+use std::fs;
 use std::path::{Path, PathBuf};
+
+pub const AGENT_BLOCK_START: &str = "<!-- snap-agent-block:start -->";
+pub const AGENT_BLOCK_END: &str = "<!-- snap-agent-block:end -->";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -83,6 +87,75 @@ pub fn upsert_project(
     reg.save(&paths.projects)
 }
 
+pub fn agent_markdown_block() -> String {
+    format!(
+        "{AGENT_BLOCK_START}\n## Snap\n\nThis repo uses Snap for visual annotations.\n\n\
+- At the start of a UI task, run `snap check`.\n\
+- If `has_new` is true, run `snap latest` or `snap list`.\n\
+- Read the PNG at `image_path`. The image has the markup.\n\
+- Red circles/rectangles mark a problem.\n\
+- Arrows mark a move or a connection.\n\
+- Text labels are instructions.\n\
+- Numbered markers are an ordered list.\n\
+- Freehand marks an area.\n\n\
+After the user accepts the work, run `snap clear`.\n\
+{AGENT_BLOCK_END}\n"
+    )
+}
+
+pub fn patch_agent_markdown(repo: &Path) -> Result<PathBuf, InitError> {
+    let agents = repo.join("AGENTS.md");
+    let claude = repo.join("CLAUDE.md");
+    let path = if agents.exists() {
+        agents
+    } else if claude.exists() {
+        claude
+    } else {
+        agents
+    };
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let block = agent_markdown_block();
+    let next = if let Some(start) = existing.find(AGENT_BLOCK_START) {
+        let end = existing[start..]
+            .find(AGENT_BLOCK_END)
+            .map(|i| start + i + AGENT_BLOCK_END.len())
+            .unwrap_or(existing.len());
+        let mut s = String::new();
+        s.push_str(&existing[..start]);
+        s.push_str(&block);
+        let rest = existing[end..].trim_start_matches('\n');
+        if !rest.is_empty() {
+            s.push('\n');
+            s.push_str(rest);
+        }
+        s
+    } else if existing.is_empty() {
+        block
+    } else {
+        format!("{}\n\n{block}", existing.trim_end())
+    };
+    fs::write(&path, next).map_err(|e| InitError::Io(e.to_string()))?;
+    Ok(path)
+}
+
+pub fn init_project(cwd: &Path, paths: &Paths, now: DateTime<Utc>) -> Result<PathBuf, InitError> {
+    let repo = find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let snap = repo.join(".snap");
+    fs::create_dir_all(snap.join("inbox")).map_err(|e| InitError::Io(e.to_string()))?;
+    let name = repo.file_name().unwrap_or_default().to_string_lossy();
+    fs::write(
+        snap.join("config.toml"),
+        format!("[project]\nname = \"{name}\"\n"),
+    )
+    .map_err(|e| InitError::Io(e.to_string()))?;
+    fs::write(snap.join(".gitignore"), "inbox/\nlast_read\n")
+        .map_err(|e| InitError::Io(e.to_string()))?;
+    upsert_project(paths, &repo, &name, now)?;
+    set_active(paths, &repo)?;
+    patch_agent_markdown(&repo)?;
+    Ok(repo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +223,48 @@ mod tests {
         upsert_project(&paths, &repo, "n", Utc::now()).unwrap();
         let reg = crate::state::ProjectRegistry::load(&paths.projects).unwrap();
         assert_eq!(reg.projects.len(), 1);
+    }
+
+    #[test]
+    fn init_creates_layout_and_agents_md() {
+        let (tmp, paths) = setup();
+        let repo = tmp.path().join("app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let root = init_project(&repo, &paths, Utc::now()).unwrap();
+        assert_eq!(root, repo);
+        assert!(repo.join(".snap/config.toml").exists());
+        assert!(repo.join(".snap/inbox").is_dir());
+        let gi = fs::read_to_string(repo.join(".snap/.gitignore")).unwrap();
+        assert!(gi.contains("inbox/"));
+        assert!(gi.contains("last_read"));
+        let md = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+        assert!(md.contains(AGENT_BLOCK_START));
+        assert!(md.contains("snap check"));
+        let state = crate::state::GlobalState::load(&paths.state).unwrap();
+        assert_eq!(state.active_project.as_deref(), Some(repo.as_path()));
+    }
+
+    #[test]
+    fn init_twice_does_not_duplicate_block() {
+        let (tmp, paths) = setup();
+        let repo = tmp.path().join("app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        init_project(&repo, &paths, Utc::now()).unwrap();
+        init_project(&repo, &paths, Utc::now()).unwrap();
+        let md = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+        assert_eq!(md.matches(AGENT_BLOCK_START).count(), 1);
+    }
+
+    #[test]
+    fn init_patches_existing_claude_md() {
+        let (tmp, paths) = setup();
+        let repo = tmp.path().join("app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("CLAUDE.md"), "# Project\n").unwrap();
+        init_project(&repo, &paths, Utc::now()).unwrap();
+        assert!(!repo.join("AGENTS.md").exists());
+        let md = fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
+        assert!(md.starts_with("# Project"));
+        assert!(md.contains(AGENT_BLOCK_START));
     }
 }
