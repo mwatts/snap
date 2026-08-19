@@ -1,4 +1,5 @@
 use crate::daemon;
+use crate::doctor;
 use crate::inbox::{Inbox, InboxError};
 use crate::ipc::{send_request, IpcError, Request, Response};
 use crate::paths::Paths;
@@ -68,7 +69,10 @@ fn run_inner() -> anyhow::Result<ExitCode> {
         Commands::Stop => cmd_stop(),
         Commands::Status => cmd_status(),
         Commands::Capture => cmd_capture(),
-        Commands::Doctor => Ok(daemon_not_implemented()),
+        Commands::Doctor => {
+            let paths = Paths::discover()?;
+            Ok(doctor::run(&paths))
+        }
     }
 }
 
@@ -236,7 +240,4 @@ fn print_status(resp: &Response) {
     println!("socket: {socket}");
 }
 
-fn daemon_not_implemented() -> ExitCode {
-    eprintln!("daemon not implemented");
-    ExitCode::from(1)
-}
+

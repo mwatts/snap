@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod cli;
 pub mod daemon;
+pub mod doctor;
 pub mod draw;
 pub mod inbox;
 pub mod ipc;
