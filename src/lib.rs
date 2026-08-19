@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod inbox;
+pub mod ipc;
 pub mod logutil;
 pub mod paths;
 pub mod project;
